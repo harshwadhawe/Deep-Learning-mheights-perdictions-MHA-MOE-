@@ -1,45 +1,171 @@
 # Deep Learning for LP m-Height Prediction (MHA + MoE)
 
-This repository contains the code and datasets for predicting the **log2(m-height)** of a given parity matrix $P$ and its associated parameters $(n, k, m)$. The model utilizes a **Transformer Encoder** backbone with a **Soft-Gated Mixture-of-Experts (MoE)** head to handle the highly non-linear and regime-dependent nature of the problem.
+This repository provides a full deep-learning pipeline for predicting the **log₂(m-height)** of a parity-check matrix (P) given parameters ((n, k, m)). The model combines a **Transformer Encoder** backbone with a **Soft-Gated Mixture-of-Experts (MoE)** output layer to capture the highly non-linear structure of Linear Programming (LP) m-height estimation.
+
+---
 
 ## 📂 Repository Structure
 
 ### **1. Core Notebook**
-* **`Best_model_v2.ipynb`**: The main Jupyter Notebook containing the end-to-end pipeline.
-    * **Architecture**: Defines the 2.46M parameter model using Multi-Head Attention (6 layers) and 7-expert MoE.
-    * **Training**: Implements the training loop with `tf.distribute.MirroredStrategy` for A100 GPUs, including the "Hard Example Mining" and "Cooldown" phases.
-    * **Inference**: Contains the evaluation script and the **Test-Time Augmentation (TTA)** logic for final predictions.
+
+**`Best_model_v2.ipynb`** — the main end-to-end workflow.
+
+**Highlights:**
+
+* **Model Architecture**
+  A 2.46M-parameter network with **6 Transformer layers** and a **7-Expert MoE head**.
+
+* **Training Pipeline**
+  Trains with `tf.distribute.MirroredStrategy` on A100 GPUs and includes:
+
+  * **Hard Example Mining** — focuses on the top 10% error samples.
+  * **Cooldown Phase** — stabilizes the model with a reduced learning rate and a mixed dataset of normal + hard samples.
+
+* **Inference + Test-Time Augmentation (TTA)**
+  Implements the full evaluation script with 16-way augmentation for robust predictions.
+
+---
 
 ### **2. Data Generation**
-* **`data_gen.py`**: The Python script used to generate the synthetic parity matrices and their corresponding ground-truth m-heights using Linear Programming (LP). This script was used to create the 102k supplemental samples used to boost the dataset size.
 
-### **3. Data Directories**
-* **`tf_dataset/`**: Contains the processed datasets in **TFRecord format** for high-performance training.
-    * `train.tfrecord`, `val.tfrecord`, `test.tfrecord`: Standard splits.
-    * `hard_booster_legal.tfrecord`: The mined "hard" examples used for the booster training phase.
-    * `dataset_info.json`: Metadata including normalization statistics (mean/variance) and matrix dimensions.
+**`data_gen.py`**
+Creates synthetic parity matrices and corresponding LP-computed m-heights.
+Used to generate >100k supplemental training samples (45k, 54k, 90k, 108k). All synthetic datasets were produced on the TAMU HPRC using 64-core CPU nodes for fast LP solving.
 
-* **`train_data/`**: The raw pickle files (`.pkl`) containing the training inputs (matrices $P$ and parameters $n, k, m$) and labels (m-heights). Includes both the instructor-provided data and custom-generated "Giant" matrices.
+---
 
-* **`test_data/`**: Contains the validation and test sets used for final scoring, such as `x_full_dataset_4.5k_samples.pkl`.
+## **3. Data Directories**
 
-## 🚀 Key Techniques
-* **Architecture**: Context-aware Transformer Encoders + Soft-Gated Mixture of Experts.
-* **Hard Mining**: A secondary training phase focusing exclusively on the top 10% highest-error samples.
-* **Cooldown**: A final fine-tuning phase with a low learning rate and a mixed dataset (90% normal / 10% hard) to stabilize the model.
-* **Test-Time Augmentation (TTA)**: 
+### **`tf_dataset/` — TFRecord Training Data**
 
-[Image of Test Time Augmentation]
- During inference, the input matrix is augmented 16 times (column permutations/sign flips) and predictions are averaged in log-space to reduce variance.
+A high-performance dataset used by the TensorFlow training pipeline.
+
+Includes:
+
+* `train.tfrecord`, `val.tfrecord`, `test.tfrecord`
+* `hard_booster_legal.tfrecord` — the mined hard subset for booster training
+* `dataset_info.json` — mean/variance statistics, matrix dimensions ((p_{\text{rows}} , p_{\text{cols}} , m_{\max}))
+
+---
+
+### **Why `.tfrecord`?**
+
+`.tfrecord` format is preferred for training because:
+
+1. **High-throughput I/O** optimized for GPU pipelines.
+2. **Streaming efficiency**, avoiding full `.pkl` loads into memory.
+3. **Seamless integration with `tf.data`**, enabling parallel decoding, prefetching, and fast batching.
+
+---
+
+### **`train_data/` — Raw Training Sources**
+
+These are the original pickle files before TFRecord conversion:
+
+```python
+DATA_SOURCES = [
+    ("train_data/input_data_56k.pkl",  "train_data/output_data_56k.pkl",  "Instructor_56k", True),
+    ("train_data/X_generated_45k.pkl", "train_data/y_generated_45k.pkl",  "Generated_45k",  False),
+    ("train_data/X_generated_54k.pkl", "train_data/y_generated_54k.pkl",  "Generated_54k",  False),
+    ("train_data/X_generated_90k.pkl", "train_data/y_generated_90k.pkl",  "Generated_90k",  False),
+    ("train_data/X_generated_108k.pkl","train_data/y_generated_108k.pkl", "Generated_108k", False),
+]
+```
+
+* The **56k dataset** was provided by the instructor.
+* All other datasets were **generated on TAMU HPRC** via `data_gen.py` using 64-core CPU nodes.
+
+These files are merged and transformed into TFRecords for efficient training.
+
+---
+
+### **`test_data/` — Evaluation Data**
+
+Used exclusively for inference and leaderboard scoring:
+
+```
+INPUT_PATH  = "test_data/x_full_dataset_4.5k_samples.pkl"
+OUTPUT_PATH = "test_data/y_full_dataset_4.5k_samples.pkl"
+```
+
+---
+
+## 🚀 Key Techniques & Innovations
+
+### **1. Transformer + MoE Architecture**
+
+A multi-head attention encoder extracts structural features from the parity matrix, while the Soft-Gated MoE head models distinct behavior across different ((n, k, m)) regimes.
+
+---
+
+### **2. Hard Example Mining**
+
+After the initial training cycle:
+
+* The **top 10% worst-performing samples** are identified.
+* A booster phase trains the model exclusively on these hard cases.
+* Result: significantly improved performance on tail and high-complexity matrices.
+
+---
+
+### **3. Cooldown Fine-Tuning**
+
+A stabilization stage with:
+
+* **90% regular samples**
+* **10% hard samples**
+* A reduced learning rate
+
+This reduces prediction variance and prevents overfitting introduced during booster training.
+
+---
+
+### **4. Test-Time Augmentation (TTA)**
+
+During inference:
+
+* Each matrix is augmented **16 times** using valid column permutations and sign flips.
+* Predictions are averaged **in log-space**, improving consistency and eliminating variance from augmentation randomness.
+
+---
 
 ## 🛠️ Requirements
+
 * Python 3.10+
 * TensorFlow 2.x
 * NumPy
 * Pandas
-* Matplotlib / Seaborn (for visualization)
+* Matplotlib / Seaborn
+* CUDA 12 (for GPU acceleration)
 
-## Usage
-1.  **Generate Data**: Run `data_gen.py` if you need to create fresh samples.
-2.  **Train**: Open `Best_model_v2.ipynb` and execute the training cells. Ensure `tf_dataset/` is populated first by running the conversion cells in the notebook.
-3.  **Evaluate**: Use the inference section in the notebook to run TTA on `test_data/`.
+---
+
+## ▶️ Usage Guide
+
+### **1. (Optional) Generate Synthetic Data**
+
+```bash
+python data_gen.py
+```
+
+Generates new parity matrices and computes their LP m-heights.
+
+---
+
+### **2. Train the Model**
+
+Open `Best_model_v2.ipynb` and run:
+
+* **Dataset Conversion Cells** → builds `.tfrecord` files from raw pickle datasets
+* **Training Cells** → runs full training, hard mining, and cooldown
+
+---
+
+### **3. Evaluate the Model (with TTA)**
+
+In the notebook:
+
+* Load the 4.5k test set from `test_data/`
+* Run the inference section to compute TTA-averaged predictions
+
+
